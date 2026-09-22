@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""Local entry point: ``uv run uvicorn main:app``."""
 
-app = FastAPI()
+from edge_gateway.app import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]

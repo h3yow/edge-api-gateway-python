@@ -30,6 +30,27 @@ class QuotaExceededError(GatewayError):
     status_code = 429
 
 
+class RateLimitExceededError(GatewayError):
+    """Rejected because the caller is firing too fast (short-window burst)."""
+
+    code = "RATE_LIMIT_EXCEEDED"
+    status_code = 429
+
+
+class InflightLimitExceededError(GatewayError):
+    """Rejected because the caller already has too many requests in flight."""
+
+    code = "INFLIGHT_LIMIT_EXCEEDED"
+    status_code = 429
+
+
+class UpstreamRequestError(GatewayError):
+    """Transparent proxy failed to receive any usable upstream response."""
+
+    code = "UPSTREAM_REQUEST_ERROR"
+    status_code = 502
+
+
 class AllUpstreamsUnavailableError(GatewayError):
     code = "ALL_UPSTREAMS_UNAVAILABLE"
     status_code = 503

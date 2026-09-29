@@ -10,3 +10,6 @@ build/
 
 # local server log
 uvicorn.log
+
+# local drill environment (pids/logs)
+.lab_state/

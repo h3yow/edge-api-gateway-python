@@ -20,6 +20,13 @@ class RouteRule:
     callers: frozenset[str] | None = None
     quota_limit: int | None = None
     quota_window_seconds: float = 1.0
+    # Admission control, split into three independent categories:
+    # * rate_limit     - max accepted requests per short window (burst control)
+    # * inflight_limit - max requests concurrently in flight at an instant
+    # Any unset category (None) is not enforced.
+    rate_limit: int | None = None
+    rate_window_seconds: float = 0.2
+    inflight_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,16 @@ class AttemptRecord:
     retried: bool = False
 
 
+@dataclass(frozen=True)
+class HealthEvent:
+    """A single removal/recovery record for one instance."""
+
+    instance_id: str
+    kind: str  # "removed" | "recovered"
+    reason: str
+    timestamp: float
+
+
 @dataclass
 class ForwardResult:
     status_code: int = 0
@@ -55,3 +72,6 @@ class ForwardResult:
     attempts: list[AttemptRecord] = field(default_factory=list)
     trace: list[str] = field(default_factory=list)
     quota: dict = field(default_factory=dict)
+    # Transparent-proxy fields used when talking to real network upstreams.
+    upstream_headers: dict = field(default_factory=dict)
+    upstream_body_raw: bytes = b""

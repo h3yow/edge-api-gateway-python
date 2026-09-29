@@ -22,25 +22,40 @@ cannot probe the same instance twice.
 
 from __future__ import annotations
 
-import threading
+import json
 from typing import Callable
 
 from edge_gateway.errors import (
     AllUpstreamsUnavailableError,
-    GatewayError,
+    InflightLimitExceededError,
     NonIdempotentRetryError,
+    QuotaExceededError,
+    RateLimitExceededError,
 )
 from edge_gateway.health import HealthMonitor
 from edge_gateway.models import AttemptRecord, ForwardResult, RequestContext
 from edge_gateway.quota import QuotaManager
 from edge_gateway.router import Router
 from edge_gateway.upstream import (
+    UpstreamError,
     UpstreamRegistry,
     UpstreamTimeout,
     UpstreamUnreachable,
 )
 
 IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# Maps the rejected admission category to its stable error code.
+_ADMISSION_ERRORS = {
+    "rate": RateLimitExceededError,
+    "inflight": InflightLimitExceededError,
+    "quota": QuotaExceededError,
+}
+_ADMISSION_MESSAGES = {
+    "rate": "caller is firing too many requests in the short rate window",
+    "inflight": "caller already has too many requests in flight",
+    "quota": "caller cycle quota exhausted for this rule in the current window",
+}
 
 
 class Gateway:
@@ -95,16 +110,22 @@ class Gateway:
         result.cluster = rule.cluster
         trace.append(f"route: selected rule {rule.id!r} -> cluster {rule.cluster!r}")
 
-        # 2. quota (atomic consume; rejection touches no upstream resource)
-        allowed, quota_snapshot, quota_trace = self._quotas.check(request, rule)
-        trace.extend(quota_trace)
-        result.quota = quota_snapshot
+        # 2. admission (atomic consume; rejection touches no upstream resource)
+        allowed, admission_snapshot, admission_trace, category = self._quotas.check(
+            request, rule
+        )
+        trace.extend(admission_trace)
+        result.quota = admission_snapshot
         if not allowed:
-            raise _quota_error(rule, request, quota_snapshot, trace)
+            raise _admission_error(category, rule, request, admission_snapshot, trace)
 
-        # 3. deterministic instance order, filtered by health
+        # 3. deterministic instance order, filtered by health. The inflight
+        # unit is always returned, even when dispatch raises.
         ordered = list(self._clusters[rule.cluster])
-        return self._dispatch(request, rule, ordered, result)
+        try:
+            return self._dispatch(request, rule, ordered, result)
+        finally:
+            self._quotas.release(request, rule)
 
     def _select_targets(self, cluster_instances: list[str]) -> tuple[list[str], list[str]]:
         # Opportunistically run any due recovery probes first. Claiming is
@@ -157,7 +178,7 @@ class Gateway:
             attempts += 1
             retried = attempts > 1
             try:
-                status, body = self._registry.call(instance_id, request.body)
+                status, raw_body, headers = self._registry.send(instance_id, request)
             except UpstreamUnreachable as exc:
                 # Handler never ran: failover is always safe.
                 last_error = str(exc)
@@ -165,27 +186,37 @@ class Gateway:
                     AttemptRecord(instance_id, "unreachable", str(exc), retried)
                 )
                 trace.extend(
-                    self._health.record_failure(instance_id)
+                    self._health.record_failure(
+                        instance_id, f"unreachable: {exc}"
+                    )
                 )
                 trace.append(
                     f"dispatch: {instance_id} unreachable before execution ->"
                     " failover is safe"
                 )
                 continue
-            except UpstreamTimeout as exc:
-                # Execution is unconfirmed.
+            except UpstreamError as exc:
+                # Timeout or any transport error: execution is unconfirmed.
+                if isinstance(exc, UpstreamTimeout):
+                    outcome = "timeout"
+                    why = "timed out"
+                else:
+                    outcome = "transport_error"
+                    why = "transport error"
                 last_error = str(exc)
                 result.attempts.append(
-                    AttemptRecord(instance_id, "timeout", str(exc), retried)
+                    AttemptRecord(instance_id, outcome, str(exc), retried)
                 )
-                trace.extend(self._health.record_failure(instance_id))
+                trace.extend(
+                    self._health.record_failure(instance_id, f"{outcome}: {exc}")
+                )
                 if not idempotent:
                     trace.append(
-                        f"dispatch: {instance_id} timed out and request is"
+                        f"dispatch: {instance_id} {why} and request is"
                         " non-idempotent -> NOT retried (avoid double execution)"
                     )
                     raise NonIdempotentRetryError(
-                        "upstream timed out on a non-idempotent request;"
+                        f"upstream {why} on a non-idempotent request;"
                         " failover suppressed to avoid double execution",
                         details={
                             "rule_id": rule.id,
@@ -194,16 +225,20 @@ class Gateway:
                         },
                     )
                 trace.append(
-                    f"dispatch: {instance_id} timeout, idempotent -> try next"
+                    f"dispatch: {instance_id} {why}, idempotent -> try next"
                 )
                 continue
 
-            # Handler definitely executed.
+            # Handler definitely executed (we hold a real HTTP response).
             if 500 <= status < 600:
                 result.attempts.append(
                     AttemptRecord(instance_id, "http_5xx", str(status), retried)
                 )
-                trace.extend(self._health.record_failure(instance_id))
+                trace.extend(
+                    self._health.record_failure(
+                        instance_id, f"upstream responded HTTP {status}"
+                    )
+                )
                 last_error = f"HTTP {status}"
                 if not idempotent:
                     trace.append(
@@ -233,7 +268,12 @@ class Gateway:
             result.status_code = 200
             result.instance_id = instance_id
             result.upstream_status = status
-            result.upstream_body = body
+            result.upstream_headers = dict(headers)
+            result.upstream_body_raw = raw_body
+            try:
+                result.upstream_body = json.loads(raw_body) if raw_body else {}
+            except ValueError:
+                result.upstream_body = {}
             trace.append(f"dispatch: {instance_id} answered HTTP {status} -> done")
             return result
 
@@ -252,16 +292,26 @@ class Gateway:
         )
 
 
-def _quota_error(rule, request, snapshot, trace):
-    from edge_gateway.errors import QuotaExceededError
-
-    trace.append("quota: request rejected before touching any upstream")
-    return QuotaExceededError(
-        "caller quota exhausted for this rule in the current window",
+def _admission_error(category, rule, request, snapshot, trace):
+    error_cls = _ADMISSION_ERRORS.get(category, QuotaExceededError)
+    trace.append(
+        f"admission: request rejected by category {category!r} before touching"
+        " any upstream"
+    )
+    # The plain QuotaManager reports a flat {"used","limit",...} snapshot;
+    # AdmissionManager nests it under "quota". Preserve the flat "quota"
+    # detail for backward compatibility while exposing the full split view.
+    quota_view = snapshot.get("quota", snapshot) if isinstance(snapshot, dict) else {}
+    return error_cls(
+        _ADMISSION_MESSAGES.get(category, "admission rejected the request"),
         details={
             "rule_id": rule.id,
             "cluster": rule.cluster,
             "caller": request.caller,
-            "quota": snapshot,
+            "rejected_category": category,
+            "admission": snapshot,
+            "quota": quota_view,
+            "rate": snapshot.get("rate") if isinstance(snapshot, dict) else None,
+            "inflight": snapshot.get("inflight") if isinstance(snapshot, dict) else None,
         },
     )

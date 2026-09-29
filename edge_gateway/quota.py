@@ -33,12 +33,17 @@ class QuotaManager:
     def _key(request: RequestContext, rule: RouteRule) -> tuple[str, str, str]:
         return (request.caller, rule.id, rule.cluster)
 
-    def check(self, request: RequestContext, rule: RouteRule) -> tuple[bool, dict, list[str]]:
+    def check(self, request: RequestContext, rule: RouteRule) -> tuple[bool, dict, list[str], str | None]:
         """Atomically decide and consume one quota unit.
 
-        Returns ``(allowed, snapshot, trace)``. ``snapshot`` always reports
-        the state used for the decision (limit, used, remaining, window
-        boundaries) so responses and logs can explain the verdict.
+        Returns ``(allowed, snapshot, trace, rejected_category)``. This is
+        the same protocol as :class:`~edge_gateway.admission.AdmissionManager`;
+        a plain QuotaManager only enforces the cycle-quota category and its
+        ``release`` is a no-op (it tracks no in-flight count).
+
+        ``snapshot`` always reports the state used for the decision (limit,
+        used, remaining, window boundaries) so responses and logs can
+        explain the verdict.
         """
 
         trace: list[str] = []
@@ -52,7 +57,7 @@ class QuotaManager:
                 "window_seconds": None,
             }
             trace.append(f"quota: rule {rule.id!r} has no limit -> allow")
-            return True, snapshot, trace
+            return True, snapshot, trace, None
 
         key = self._key(request, rule)
         window = rule.quota_window_seconds
@@ -89,7 +94,10 @@ class QuotaManager:
             "window_end": window_start + window,
         }
         trace.append(f"quota: {decision}")
-        return allowed, snapshot, trace
+        return allowed, snapshot, trace, ("quota" if not allowed else None)
+
+    def release(self, request: RequestContext, rule: RouteRule) -> None:
+        """No inflight tracking in the plain quota manager."""
 
     def reset(self) -> None:
         with self._lock:

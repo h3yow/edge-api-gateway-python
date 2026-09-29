@@ -16,6 +16,7 @@ Faults are injectable per instance:
 
 from __future__ import annotations
 
+import json
 import threading
 from collections import defaultdict
 from typing import Callable
@@ -75,6 +76,20 @@ class UpstreamRegistry:
         if fault == "fail":
             return 500, {"error": "simulated failure", "instance": instance_id}
         return status, payload
+
+    def send(self, instance_id: str, request) -> tuple[int, bytes, dict]:
+        """Transport-level call returning ``(status, raw_body, headers)``.
+
+        This is the same transport surface as the real HTTP registry, so the
+        gateway pipeline is identical for simulated and network upstreams.
+        It delegates to :meth:`call` (which is where the user-request counter
+        is incremented), keeping non-idempotent execution assertions exact.
+        """
+
+        status, payload = self.call(instance_id, request.body)
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"content-type": "application/json; charset=utf-8"}
+        return status, raw, headers
 
     def probe(self, instance_id: str) -> None:
         """Health-probe transport: raises UpstreamError when unreachable.

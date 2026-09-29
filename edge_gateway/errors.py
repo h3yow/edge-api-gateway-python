@@ -26,7 +26,23 @@ class RouteConflictError(GatewayError):
 
 
 class QuotaExceededError(GatewayError):
+    """The per-window total budget for this caller/rule is used up."""
+
     code = "QUOTA_EXCEEDED"
+    status_code = 429
+
+
+class RateLimitedError(GatewayError):
+    """Too many requests from this caller in the short burst window."""
+
+    code = "RATE_LIMITED"
+    status_code = 429
+
+
+class InflightLimitExceededError(GatewayError):
+    """Too many of this caller's requests are already in flight."""
+
+    code = "INFLIGHT_LIMIT_EXCEEDED"
     status_code = 429
 
 

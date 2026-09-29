@@ -27,13 +27,18 @@ Concurrency guarantees
 from __future__ import annotations
 
 import threading
-from typing import Callable
+from collections import deque
+from typing import Callable, Deque
 
 from edge_gateway.upstream import UpstreamError, UpstreamRegistry
 
 CLOSED = "CLOSED"
 OPEN = "OPEN"
 PROBING = "PROBING"
+
+# How many recent events (removals / recoveries / failed probes) to keep per
+# instance for inspection via snapshot().
+EVENT_HISTORY = 20
 
 
 class _InstanceState:
@@ -44,6 +49,8 @@ class _InstanceState:
         "opened_at",
         "probe_in_flight",
         "last_probe_ok",
+        "last_failure_reason",
+        "events",
     )
 
     def __init__(self) -> None:
@@ -53,6 +60,8 @@ class _InstanceState:
         self.opened_at = 0.0
         self.probe_in_flight = False
         self.last_probe_ok: bool | None = None
+        self.last_failure_reason = ""
+        self.events: Deque[dict] = deque(maxlen=EVENT_HISTORY)
 
 
 class HealthMonitor:
@@ -64,12 +73,16 @@ class HealthMonitor:
         recovery_threshold: int = 2,
         probe_interval: float = 0.05,
         time_func: Callable[[], float] = __import__("time").monotonic,
+        wall_clock: Callable[[], float] = __import__("time").time,
     ) -> None:
         self._registry = registry
         self._failure_threshold = failure_threshold
         self._recovery_threshold = recovery_threshold
         self._probe_interval = probe_interval
         self._time = time_func
+        # Wall clock only annotates human-facing event timestamps; state
+        # decisions always use the injectable monotonic ``time_func``.
+        self._wall = wall_clock
         self._states = {instance_id: _InstanceState() for instance_id in instances}
         self._lock = threading.Lock()
 
@@ -92,9 +105,30 @@ class HealthMonitor:
                     "recovery_successes": s.recovery_successes,
                     "probe_in_flight": s.probe_in_flight,
                     "last_probe_ok": s.last_probe_ok,
+                    "last_failure_reason": s.last_failure_reason,
+                    "events": list(s.events),
                 }
                 for instance_id, s in self._states.items()
             }
+
+    def events(self, instance_id: str) -> list[dict]:
+        """Recent removal/recovery/probe-failure records, oldest first."""
+
+        with self._lock:
+            return list(self._states[instance_id].events)
+
+    def _record_event(
+        self, st: _InstanceState, kind: str, reason: str, extra: dict | None = None
+    ) -> None:
+        event = {
+            "kind": kind,
+            "reason": reason,
+            "monotonic_at": self._time(),
+            "time": self._wall(),
+        }
+        if extra:
+            event.update(extra)
+        st.events.append(event)
 
     # -- live-traffic feedback --------------------------------------------
 
@@ -106,27 +140,35 @@ class HealthMonitor:
             # trip) does not auto-close: recovery stays probe-driven so the
             # reopen decision is made at exactly one place.
 
-    def record_failure(self, instance_id: str) -> list[str]:
+    def record_failure(self, instance_id: str, reason: str = "live_failure") -> list[str]:
         """Record one live-traffic failure and trip at the threshold.
 
         Returns trace lines. The trip happens at most once per OPEN stint:
         further failures while OPEN keep the instance OPEN without emitting
-        duplicate removal events.
+        duplicate removal events. Every trip appends one ``removed`` event
+        carrying the timestamp and reason.
         """
 
         trace: list[str] = []
         with self._lock:
             s = self._states[instance_id]
+            s.last_failure_reason = reason
             s.consecutive_failures += 1
             n = s.consecutive_failures
             trace.append(
-                f"health: {instance_id} failure {n}/{self._failure_threshold}"
+                f"health: {instance_id} failure {n}/{self._failure_threshold} ({reason})"
             )
             if s.state == CLOSED and n >= self._failure_threshold:
                 s.state = OPEN
                 s.opened_at = self._time()
                 s.recovery_successes = 0
                 s.probe_in_flight = False
+                self._record_event(
+                    s,
+                    "removed",
+                    reason,
+                    {"consecutive_failures": n, "threshold": self._failure_threshold},
+                )
                 trace.append(
                     f"health: {instance_id} tripped OPEN and removed from rotation"
                 )
@@ -184,15 +226,28 @@ class HealthMonitor:
                     s.state = CLOSED
                     s.consecutive_failures = 0
                     reopened = True
+                    self._record_event(
+                        s,
+                        "recovered",
+                        f"{s.recovery_successes} consecutive successful probes",
+                        {"recovery_successes": s.recovery_successes},
+                    )
                 else:
                     # Not yet convinced: keep it out of rotation but allow
                     # another probe after the interval.
                     s.state = OPEN
                     s.opened_at = self._time()
             else:
+                streak_before = s.recovery_successes
                 s.recovery_successes = 0
                 s.state = OPEN
                 s.opened_at = self._time()
+                self._record_event(
+                    s,
+                    "probe_failed",
+                    "probe transport error or unhealthy answer",
+                    {"streak_before": streak_before},
+                )
         return reopened
 
     def reset(self) -> None:
@@ -204,3 +259,5 @@ class HealthMonitor:
                 s.opened_at = 0.0
                 s.probe_in_flight = False
                 s.last_probe_ok = None
+                s.last_failure_reason = ""
+                s.events.clear()

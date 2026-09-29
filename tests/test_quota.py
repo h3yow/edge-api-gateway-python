@@ -9,9 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from conftest import Harness, log_case, make_request
+from edge_gateway.admission import AdmissionManager
 from edge_gateway.errors import QuotaExceededError
 from edge_gateway.gateway import Gateway
-from edge_gateway.quota import QuotaManager
 
 ORDERS_DEFAULT_LIMIT = 4
 
@@ -145,7 +145,7 @@ def test_quotas_are_isolated_per_caller(harness):
 
 def test_window_rolls_over_and_quota_refreshes():
     clock = {"t": 0.0}
-    quotas = QuotaManager(time_func=lambda: clock["t"])
+    quotas = AdmissionManager(time_func=lambda: clock["t"])
     harness = Harness()
     harness.quotas = quotas
     harness.gateway = Gateway(

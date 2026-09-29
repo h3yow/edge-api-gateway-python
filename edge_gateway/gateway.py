@@ -28,11 +28,15 @@ from typing import Callable
 from edge_gateway.errors import (
     AllUpstreamsUnavailableError,
     GatewayError,
+    InflightLimitExceededError,
     NonIdempotentRetryError,
+    QuotaExceededError,
+    RateLimitedError,
 )
 from edge_gateway.health import HealthMonitor
 from edge_gateway.models import AttemptRecord, ForwardResult, RequestContext
-from edge_gateway.quota import QuotaManager
+from edge_gateway.admission import AdmissionManager, INFLIGHT, QUOTA, RATE
+from edge_gateway.realupstream import HttpUpstreamRegistry, UpstreamResponse
 from edge_gateway.router import Router
 from edge_gateway.upstream import (
     UpstreamRegistry,
@@ -47,20 +51,31 @@ class Gateway:
     def __init__(
         self,
         router: Router,
-        quotas: QuotaManager,
+        quotas,
         health: HealthMonitor,
-        registry: UpstreamRegistry,
+        registry,
         clusters: dict[str, list[str]],
         max_attempts: int = 3,
         time_func: Callable[[], float] = __import__("time").monotonic,
+        transparent: bool | None = None,
+        recovery=None,
     ) -> None:
         self._router = router
+        # Accepts either the new three-category AdmissionManager or the
+        # legacy QuotaManager (which exposes the same check/reset surface).
         self._quotas = quotas
+        self._admission = isinstance(quotas, AdmissionManager)
         self._health = health
         self._registry = registry
         self._clusters = clusters
         self._max_attempts = max_attempts
         self._time = time_func
+        # Real network upstreams are forwarded byte-for-byte by default;
+        # simulated ones keep the explainable JSON envelope.
+        if transparent is None:
+            transparent = isinstance(registry, HttpUpstreamRegistry)
+        self._transparent = transparent
+        self._recovery = recovery
 
     # -- explanation -------------------------------------------------------
 
@@ -77,6 +92,9 @@ class Gateway:
             out["quota"] = {
                 "limit": rule.quota_limit,
                 "window_seconds": rule.quota_window_seconds,
+                "rate_limit": rule.rate_limit,
+                "rate_window_seconds": rule.rate_window_seconds,
+                "inflight_limit": rule.inflight_limit,
             }
         return out
 
@@ -95,16 +113,25 @@ class Gateway:
         result.cluster = rule.cluster
         trace.append(f"route: selected rule {rule.id!r} -> cluster {rule.cluster!r}")
 
-        # 2. quota (atomic consume; rejection touches no upstream resource)
-        allowed, quota_snapshot, quota_trace = self._quotas.check(request, rule)
-        trace.extend(quota_trace)
-        result.quota = quota_snapshot
+        # 2. admission (atomic rate+inflight+quota; rejection touches no
+        #    upstream and consumes nothing in any category)
+        allowed, admission_snapshot, admission_trace = self._quotas.check(request, rule)
+        trace.extend(admission_trace)
+        result.admission = admission_snapshot
+        # Backward-compatible single-category view.
+        result.quota = admission_snapshot.get(QUOTA, admission_snapshot)
         if not allowed:
-            raise _quota_error(rule, request, quota_snapshot, trace)
+            raise _admission_error(rule, request, admission_snapshot, trace)
 
-        # 3. deterministic instance order, filtered by health
+        # 3. deterministic instance order, filtered by health. The inflight
+        #    slot is released on every exit path (success, upstream error or
+        #    no-available-instance rejection).
         ordered = list(self._clusters[rule.cluster])
-        return self._dispatch(request, rule, ordered, result)
+        try:
+            return self._dispatch(request, rule, ordered, result)
+        finally:
+            if self._admission:
+                self._quotas.release(request, rule)
 
     def _select_targets(self, cluster_instances: list[str]) -> tuple[list[str], list[str]]:
         # Opportunistically run any due recovery probes first. Claiming is
@@ -118,6 +145,15 @@ class Gateway:
                 else f"probe: {instance_id} still unavailable"
             )
         return self._health.available_in(cluster_instances), probe_trace
+
+    def _call_upstream(self, instance_id: str, request: RequestContext):
+        """Dispatch via either the network or the in-process registry."""
+
+        if isinstance(self._registry, HttpUpstreamRegistry):
+            return self._registry.call(instance_id, request)
+        # In-process simulated registry keeps its (instance_id, body) shape.
+        status, payload = self._registry.call(instance_id, request.body)
+        return UpstreamResponse(status=status, body=_json_bytes(payload), headers={})
 
     def _dispatch(
         self,
@@ -157,7 +193,8 @@ class Gateway:
             attempts += 1
             retried = attempts > 1
             try:
-                status, body = self._registry.call(instance_id, request.body)
+                response = self._call_upstream(instance_id, request)
+                status = response.status
             except UpstreamUnreachable as exc:
                 # Handler never ran: failover is always safe.
                 last_error = str(exc)
@@ -165,7 +202,7 @@ class Gateway:
                     AttemptRecord(instance_id, "unreachable", str(exc), retried)
                 )
                 trace.extend(
-                    self._health.record_failure(instance_id)
+                    self._health.record_failure(instance_id, reason=f"unreachable: {exc}")
                 )
                 trace.append(
                     f"dispatch: {instance_id} unreachable before execution ->"
@@ -178,7 +215,9 @@ class Gateway:
                 result.attempts.append(
                     AttemptRecord(instance_id, "timeout", str(exc), retried)
                 )
-                trace.extend(self._health.record_failure(instance_id))
+                trace.extend(
+                    self._health.record_failure(instance_id, reason=f"timeout: {exc}")
+                )
                 if not idempotent:
                     trace.append(
                         f"dispatch: {instance_id} timed out and request is"
@@ -203,7 +242,11 @@ class Gateway:
                 result.attempts.append(
                     AttemptRecord(instance_id, "http_5xx", str(status), retried)
                 )
-                trace.extend(self._health.record_failure(instance_id))
+                trace.extend(
+                    self._health.record_failure(
+                        instance_id, reason=f"http_{status}"
+                    )
+                )
                 last_error = f"HTTP {status}"
                 if not idempotent:
                     trace.append(
@@ -230,10 +273,16 @@ class Gateway:
             result.attempts.append(
                 AttemptRecord(instance_id, "success", f"HTTP {status}", retried)
             )
-            result.status_code = 200
+            result.status_code = status if self._transparent else 200
             result.instance_id = instance_id
             result.upstream_status = status
-            result.upstream_body = body
+            if self._transparent:
+                # Real network mode: status, body and headers go back to the
+                # caller verbatim.
+                result.raw_body = response.body
+                result.raw_headers = dict(response.headers)
+            else:
+                result.upstream_body = _json_loads(response.body)
             trace.append(f"dispatch: {instance_id} answered HTTP {status} -> done")
             return result
 
@@ -252,16 +301,52 @@ class Gateway:
         )
 
 
-def _quota_error(rule, request, snapshot, trace):
-    from edge_gateway.errors import QuotaExceededError
+def _json_bytes(payload: dict) -> bytes:
+    import json
 
-    trace.append("quota: request rejected before touching any upstream")
-    return QuotaExceededError(
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _json_loads(raw: bytes):
+    import json
+
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {"raw": raw.decode("utf-8", errors="replace")}
+
+
+_ADMISSION_ERRORS = {
+    RATE: (
+        RateLimitedError,
+        "caller is sending too fast: short-burst rate limit reached",
+    ),
+    INFLIGHT: (
+        InflightLimitExceededError,
+        "caller has too many requests already in flight",
+    ),
+    QUOTA: (
+        QuotaExceededError,
         "caller quota exhausted for this rule in the current window",
+    ),
+}
+
+
+def _admission_error(rule, request, snapshot, trace):
+    category = snapshot.get("rejected_category", QUOTA)
+    error_cls, message = _ADMISSION_ERRORS[category]
+    trace.append("admission: request rejected before touching any upstream")
+    return error_cls(
+        message,
         details={
             "rule_id": rule.id,
             "cluster": rule.cluster,
             "caller": request.caller,
-            "quota": snapshot,
+            "rejected_category": category,
+            "admission": snapshot,
+            # Flat per-category views for direct inspection.
+            "rate": snapshot.get(RATE),
+            "inflight": snapshot.get(INFLIGHT),
+            "quota": snapshot.get(QUOTA),
         },
     )

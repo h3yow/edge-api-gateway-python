@@ -50,6 +50,20 @@ def default_rules() -> list[RouteRule]:
             quota_limit=8,
             quota_window_seconds=1.0,
         ),
+        # All three admission categories at once: short-burst rate,
+        # simultaneous inflight, and a per-window total budget. Demonstrates
+        # RATE_LIMITED / INFLIGHT_LIMIT_EXCEEDED / QUOTA_EXCEEDED separately.
+        RouteRule(
+            id="payments-api",
+            priority=350,
+            cluster="users-v1",
+            path_prefix="/payments",
+            quota_limit=5,
+            quota_window_seconds=3.0,
+            rate_limit=3,
+            rate_window_seconds=1.0,
+            inflight_limit=2,
+        ),
         # Caller-scoped orders route, illustrating caller matching.
         RouteRule(
             id="orders-vip",
@@ -100,4 +114,27 @@ def default_clusters() -> dict[str, list[str]]:
         "users-v2": ["users-v2-1"],
         "orders-v1": ["orders-v1-1", "orders-v1-2"],
         "orders-v2": ["orders-v2-1"],
+    }
+
+
+#: Fixed (instance id -> (host, port)) topology for the local network drill.
+#: Ports stay fixed so the drill CLI and the gateway share the same map and
+#: individual upstream processes can be addressed directly.
+DEFAULT_NETWORK_TOPOLOGY: dict[str, tuple[str, int]] = {
+    "users-v1-1": ("127.0.0.1", 19101),
+    "users-v1-2": ("127.0.0.1", 19102),
+    "users-v2-1": ("127.0.0.1", 19103),
+    "orders-v1-1": ("127.0.0.1", 19104),
+    "orders-v1-2": ("127.0.0.1", 19105),
+    "orders-v2-1": ("127.0.0.1", 19106),
+}
+
+
+def default_network_base_urls(
+    topology: dict[str, tuple[str, int]] | None = None,
+) -> dict[str, str]:
+    topology = topology or DEFAULT_NETWORK_TOPOLOGY
+    return {
+        instance_id: f"http://{host}:{port}"
+        for instance_id, (host, port) in topology.items()
     }

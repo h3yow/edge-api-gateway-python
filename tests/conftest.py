@@ -16,7 +16,7 @@ from edge_gateway.config import default_clusters, default_rules
 from edge_gateway.gateway import Gateway
 from edge_gateway.health import HealthMonitor
 from edge_gateway.models import RequestContext
-from edge_gateway.quota import QuotaManager
+from edge_gateway.admission import AdmissionManager
 from edge_gateway.router import Router, RuleRegistry
 from edge_gateway.upstream import build_default_registry
 
@@ -71,7 +71,7 @@ class Harness:
             recovery_threshold=recovery_threshold,
             probe_interval=probe_interval,
         )
-        self.quotas = QuotaManager()
+        self.quotas = AdmissionManager()
         self.gateway = Gateway(
             router=Router(RuleRegistry(self.rules)),
             quotas=self.quotas,

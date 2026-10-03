@@ -136,7 +136,57 @@ PROBING → 探测：
 - 尝试上限 `max_attempts=3`；集群全不可用 → `503 ALL_UPSTREAMS_UNAVAILABLE`（带尝试明细）。
 - 非幂等"最多执行一次"由上游真实进程的用户请求执行计数（`/__admin/state` 的 `calls`）在测试中断言。
 
-## 5. 两种形态的响应差异
+## 5. 真实网络模式下的并发语义
+
+网关入口是 ASGI 应用，但决策流水线要做的就是**阻塞式上游 socket I/O**。因此每个被转发的请求
+（以及网络模式的故障注入）都通过 `run_in_threadpool` 放到工作线程上执行，事件循环本身
+从不被上游拖住。由此得到的语义：
+
+- **并发请求真并发**：同一时刻到达的多个请求在各自的工作线程里并行等上游。
+  N 个各需 ~0.8s 的慢请求一起发出，总耗时 ≈ 0.8s（接近单个慢请求），而不是 N×0.8s 逐个累加。
+- **单个上游变慢/卡住/重启不冻住入口**：慢上游只占住一个工作线程；
+  这期间其它路由的请求、`GET /healthz`、`GET /__admin/state` 等运维接口都照常即时响应。
+- **三类准入在真实网络入口下真实生效**（进程内测能过、走真实网络也必须能复现）：
+  - **rate（短时间冲得太猛）**：突发窗口内到达即计，超限请求立即 `429 RATE_LIMITED`；
+  - **inflight（同时在途太多）**：上游慢时槽位被真实占住，超出 `inflight_limit` 的并发请求
+    在进入上游前被 `429 INFLIGHT_LIMIT_EXCEEDED` 拒绝——只有真并发才碰得到这一类；
+  - **quota（周期额度用光）**：窗口内总量耗尽后 `429 QUOTA_EXCEEDED`，与请求快慢无关。
+  - 被拒绝的请求**不占用上游资源**（上游执行计数不增加）、不白扣其它类别；
+    判定+消费在同一把锁的临界区内完成，**并发、上游变慢或重启期间都不会超额放行**。
+
+本地复现与验证：
+
+```bash
+# 自动化（真实 uvicorn 入口 + 真实上游进程 + 多线程并发客户端）
+uv run pytest tests/test_network_concurrency.py -v -s
+
+# 手工：先 drill up，再把 users-v1-1 调慢 3 秒
+uv run python -m edge_gateway.drill up
+uv run python -m edge_gateway.drill slow users-v1-1 3
+
+# 1) 并发慢请求：两个一起发，总耗时 ≈ 3s 而非 6s
+time (curl -s -H 'x-caller-id: p1' http://127.0.0.1:19080/users/1 & \
+      curl -s -H 'x-caller-id: p2' http://127.0.0.1:19080/users/1 & wait)
+
+# 2) 慢请求在途期间，运维接口与不相干路由不被拖住（应立即返回）
+curl -s -H 'x-caller-id: p3' http://127.0.0.1:19080/users/1 &
+sleep 0.3
+time curl -s http://127.0.0.1:19080/healthz
+time curl -s http://127.0.0.1:19080/__admin/state
+time curl -s -H 'x-caller-id: p4' http://127.0.0.1:19080/orders/1
+
+# 3) inflight：慢上游期间并发发 3 个 /payments（限额 2），第 3 个立即 429
+uv run python -m edge_gateway.drill slow users-v1-1 3
+for i in 1 2 3; do
+  curl -s -o /dev/null -w '%{http_code}\n' -H 'x-caller-id: pay' \
+    http://127.0.0.1:19080/payments/1 &
+done; wait
+
+uv run python -m edge_gateway.drill normal users-v1-1
+uv run python -m edge_gateway.drill down
+```
+
+## 6. 两种形态的响应差异
 
 - 模拟模式成功响应是可解释信封：`rule_id / cluster / instance_id / upstream_status /
   data / quota / admission / attempts / trace`。
@@ -152,7 +202,7 @@ PROBING → 探测：
 `INFLIGHT_LIMIT_EXCEEDED(429)`、`QUOTA_EXCEEDED(429)`、
 `NON_IDEMPOTENT_NOT_RETRIED(502)`、`ALL_UPSTREAMS_UNAVAILABLE(503)`。
 
-## 6. 管理 / 可观测端点
+## 7. 管理 / 可观测端点
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -163,7 +213,7 @@ PROBING → 探测：
 | `POST /__admin/faults` | 模拟模式：`fail/timeout/down/null`；网络模式：`error/slow/null`（真停进程用 drill CLI） |
 | `POST /__admin/reset` | 重置准入与健康（模拟模式还清故障与计数） |
 
-## 7. 兼容范围
+## 8. 兼容范围
 
 - 模拟模式的全部既有行为（路由优先级、冲突识别、无匹配、固定窗口配额、故障转移结论）保持不变：
   `quota_limit/quota_window_seconds` 字段语义不变；三类准入在未配置 rate/inflight 时退化为原配额语义。
@@ -173,7 +223,7 @@ PROBING → 探测：
   探测端点 `GET /__health`（正常/慢模式返回 200，错误模式返回 503）。
 - 仅依赖 Python 标准库 + FastAPI/httpx（测试用）；上游进程与网关均在本机回环地址运行。
 
-## 8. 本地验证
+## 9. 本地验证
 
 ```bash
 uv run pytest -q                                  # 全量（含真实进程与一键演练，约 40–50s）
@@ -182,6 +232,7 @@ uv run pytest tests/test_admission.py -q          # 三类准入边界 + 并发�
 uv run pytest tests/test_recovery.py -q           # 无流量后台自愈 / 事件记录 / 探测去重
 uv run pytest tests/test_network_upstream.py -q   # 真实进程停/重启恢复、慢/错、透传
 uv run pytest tests/test_network_http.py -q       # 网络模式 HTTP 透传 + 后台自愈集成
+uv run pytest tests/test_network_concurrency.py -q # 真实入口并发：慢请求并行/不冻入口/三类准入
 uv run pytest tests/test_drill.py -q              # 一键起停 / 停进程 / 慢响应 / 错误
 ```
 
@@ -210,7 +261,7 @@ uv run python -m edge_gateway.drill down
 > 若本机/环境设置了 HTTP 代理，对 `127.0.0.1` 的 `curl` 请加 `--noproxy '*'`，
 > 以免演练流量被代理截走。
 
-## 9. 代码结构
+## 10. 代码结构
 
 ```
 edge_gateway/
@@ -225,6 +276,7 @@ edge_gateway/
   recovery.py      # 与流量解耦的后台自愈守护线程
   gateway.py       # 路由→准入→健康感知分发→故障转移 主流水线（两种传输）
   drill.py         # 一键拉起/停止网关+上游进程、停/慢/错指定上游的演练 CLI
-  app.py           # FastAPI：app（模拟）与 network_app（真实上游，含后台自愈）
-tests/             # 路由 / 准入 / 故障转移 / 自愈 / 真实进程 / HTTP / 一键演练
+  app.py           # FastAPI：app（模拟）与 network_app（真实上游，含后台自愈）；
+                   #   阻塞流水线经 run_in_threadpool 上工作线程，慢上游不冻事件循环
+tests/             # 路由 / 准入 / 故障转移 / 自愈 / 真实进程 / HTTP / 真实入口并发 / 一键演练
 ```

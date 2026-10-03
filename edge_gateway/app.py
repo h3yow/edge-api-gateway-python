@@ -23,6 +23,13 @@ Operational endpoints (not forwarded):
 * ``POST /__admin/faults``       - inject/clear simulated or network faults
 * ``GET  /__admin/state``        - admission + health snapshot
 * ``POST /__admin/reset``        - reset admission, health and faults
+
+Concurrency: the decision pipeline performs blocking upstream socket I/O,
+so every forwarded request (and the network-mode fault injection) runs on a
+worker thread via ``run_in_threadpool``. One slow, stuck or restarting
+upstream therefore occupies one worker thread only - it can neither
+serialize concurrent requests nor starve the operational endpoints, and the
+inflight admission limit genuinely engages under real network concurrency.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from edge_gateway.admission import AdmissionManager
 from edge_gateway.config import (
@@ -243,17 +251,24 @@ def _build_app(
         try:
             if network_mode:
                 # Map the legacy fault names onto the real-process modes.
+                # The remote mode switch is a blocking network call, so it
+                # runs on a worker thread just like the request pipeline.
                 if fault in ("fail", "error"):
-                    gateway._registry.set_remote_mode(instance_id, "error")  # noqa: SLF001
+                    await run_in_threadpool(
+                        gateway._registry.set_remote_mode, instance_id, "error"  # noqa: SLF001
+                    )
                 elif fault == "slow":
                     delay = float(payload.get("delay", 1.0))
-                    gateway._registry.set_remote_mode(  # noqa: SLF001
-                        instance_id, "slow", delay=delay
+                    await run_in_threadpool(
+                        gateway._registry.set_remote_mode,  # noqa: SLF001
+                        instance_id, "slow", delay,
                     )
                 else:
                     # 'down' cannot be emulated by a live process; only the
                     # drill CLI can truly stop it. 'timeout'/None -> normal.
-                    gateway._registry.set_remote_mode(instance_id, "normal")  # noqa: SLF001
+                    await run_in_threadpool(
+                        gateway._registry.set_remote_mode, instance_id, "normal"  # noqa: SLF001
+                    )
             else:
                 gateway._registry.set_fault(instance_id, fault)  # noqa: SLF001
         except (KeyError, ValueError) as exc:
@@ -273,7 +288,11 @@ def _build_app(
     async def gateway_entry(request: Request, path: str = "") -> Response:
         ctx = await _normalize(request, path)
         try:
-            result = gateway.handle(ctx)
+            # The pipeline (upstream socket I/O, probing) is blocking; run it
+            # on a worker thread so one slow/stuck upstream never freezes the
+            # event loop: concurrent requests really run in parallel and the
+            # operational endpoints (/healthz, /__admin/*) stay responsive.
+            result = await run_in_threadpool(gateway.handle, ctx)
         except GatewayError as exc:
             return _error_response(exc)
 

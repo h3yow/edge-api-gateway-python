@@ -16,6 +16,24 @@ Two upstream transports are supported:
   caller verbatim; a background thread restores removed instances even with
   no traffic.
 
+Concurrency model
+-----------------
+The gateway pipeline (``Gateway.handle``) is fully synchronous and, in
+network mode, performs blocking socket I/O via ``http.client``. It is
+therefore **never run on the asyncio event loop**: every request is handed
+to a dedicated bounded thread pool (``EG_DISPATCH_WORKERS``, default 32).
+Consequences:
+
+* multiple requests arriving at the same instant - including several stuck
+  behind one slow upstream - are genuinely processed in parallel;
+* one frozen upstream occupies only a worker thread (bounded by the request
+  timeout), never the event loop, so ``/healthz`` and the other operational
+  endpoints, as well as requests that never touch an upstream, stay
+  responsive while a slow request is in flight;
+* admission (rate/inflight/quota) is decided before the upstream call, so
+  concurrent requests against slow or restarting upstreams can never
+  over-admit any category.
+
 Operational endpoints (not forwarded):
 * ``GET  /healthz``              - liveness of the gateway process
 * ``GET  /__routes``            - configured rules and cluster health
@@ -27,8 +45,10 @@ Operational endpoints (not forwarded):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -59,6 +79,17 @@ NETWORK_RECOVERY_THRESHOLD = 2
 NETWORK_PROBE_INTERVAL = 0.5
 NETWORK_RECOVERY_INTERVAL = 0.25
 NETWORK_REQUEST_TIMEOUT = float(os.environ.get("EG_REQUEST_TIMEOUT", "2.0"))
+
+# The gateway pipeline is fully synchronous and performs blocking socket I/O
+# in network mode (http.client). It must therefore never run on the asyncio
+# event loop: every inbound request is handed to this dedicated bounded pool
+# so that
+#   * multiple requests - including multiple requests stuck behind one slow
+#     upstream - are genuinely processed in parallel;
+#   * a frozen upstream occupies only a worker thread, never the event loop,
+#     so /healthz and the operational endpoints stay responsive;
+#   * the pool bound caps how many blocked upstreams can accumulate.
+DISPATCH_WORKERS = int(os.environ.get("EG_DISPATCH_WORKERS", "32"))
 
 
 def _new_gateway_components(registry, clusters, health_kwargs, instances=None):
@@ -170,15 +201,34 @@ def _build_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        if recovery is not None:
-            recovery.stop()
+        try:
+            yield
+        finally:
+            # Drop queued work; in-flight upstream calls are bounded by the
+            # request timeout, so this wait is itself bounded.
+            dispatcher.shutdown(wait=True, cancel_futures=True)
+            if recovery is not None:
+                recovery.stop()
+
+    # Dedicated pool: blocking gateway pipeline (and network admin calls)
+    # never touch the event loop thread.
+    dispatcher = ThreadPoolExecutor(
+        max_workers=DISPATCH_WORKERS, thread_name_prefix="eg-dispatch"
+    )
+
+    async def run_offloaded(func, *args):
+        # Grab the running loop per call; _build_app itself runs outside any
+        # event loop, so the loop cannot be captured here.
+        return await asyncio.get_running_loop().run_in_executor(
+            dispatcher, func, *args
+        )
 
     app = FastAPI(
         title="edge-api-gateway", version="0.2.0", lifespan=lifespan
     )
     app.state.gateway = gateway
     app.state.recovery = recovery
+    app.state.dispatcher = dispatcher
 
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -240,7 +290,8 @@ def _build_app(
         payload = await request.json()
         instance_id = payload.get("instance_id")
         fault = payload.get("fault")
-        try:
+
+        def apply_fault():
             if network_mode:
                 # Map the legacy fault names onto the real-process modes.
                 if fault in ("fail", "error"):
@@ -256,6 +307,11 @@ def _build_app(
                     gateway._registry.set_remote_mode(instance_id, "normal")  # noqa: SLF001
             else:
                 gateway._registry.set_fault(instance_id, fault)  # noqa: SLF001
+
+        try:
+            # set_remote_mode is itself a blocking network call in network
+            # mode; keep it off the event loop too.
+            await run_offloaded(apply_fault)
         except (KeyError, ValueError) as exc:
             return JSONResponse(
                 status_code=400, content={"ok": False, "error": str(exc)}
@@ -273,7 +329,11 @@ def _build_app(
     async def gateway_entry(request: Request, path: str = "") -> Response:
         ctx = await _normalize(request, path)
         try:
-            result = gateway.handle(ctx)
+            # The whole synchronous pipeline (including blocking upstream
+            # socket I/O) runs on a worker thread, so concurrent requests are
+            # dispatched in parallel and a frozen upstream cannot block the
+            # event loop nor the operational endpoints.
+            result = await run_offloaded(gateway.handle, ctx)
         except GatewayError as exc:
             return _error_response(exc)
 

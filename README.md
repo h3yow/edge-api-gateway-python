@@ -54,6 +54,8 @@ uv run python -m edge_gateway.drill down                # 全部停掉并清理�
   并提供 `/__health`、`/__admin/state`、`/__admin/mode` 供探测与故障注入。
 - 也可只起网关（不起上游，此时所有上游不可用）：
   `uv run uvicorn edge_gateway.app:network_app --port 19080`。
+- 网络模式的并发与隔离语义见 **第 5 节**（重要：网关主管线跑在独立工作
+  线程池，慢上游不会串行化请求或冻结入口）。
 
 调用方通过 `x-caller-id` Header 传递（缺省为 `anonymous`）。
 
@@ -136,7 +138,118 @@ PROBING → 探测：
 - 尝试上限 `max_attempts=3`；集群全不可用 → `503 ALL_UPSTREAMS_UNAVAILABLE`（带尝试明细）。
 - 非幂等"最多执行一次"由上游真实进程的用户请求执行计数（`/__admin/state` 的 `calls`）在测试中断言。
 
-## 5. 两种形态的响应差异
+## 5. 真实网络模式的并发语义
+
+### 5.1 并发请求真正并行（不再排队）
+
+网关主管线（路由 → 准入 → 阻塞式 TCP 上游调用 → 故障转移）是同步代码，
+网络模式下底层是阻塞 socket（`http.client`）。它**不会**在 asyncio 事件
+循环线程上执行：每个入站请求都被提交到网关进程内的**专用有界工作线程池**
+（`EG_DISPATCH_WORKERS`，默认 32 个线程），由工作线程完成阻塞等待。
+
+因此：
+
+- 同一时刻进来的多个请求被**真正并行**处理：两个各自 ~0.5s 的慢请求同时
+  发出时，总耗时接近 **0.5s（单个慢请求）**，而不是 ~1.0s（逐个累加）。
+- 上游 socket 等待发生在工作线程里，**事件循环线程永远不被阻塞调用占住**。
+- 连网络模式下经网络下发的 `POST /__admin/faults`（`set_remote_mode` 本身
+  也是一次阻塞 HTTP 调用）也在同一工作池执行，不占用事件循环。
+
+> 修复前的行为：`gateway.handle(...)` 直接在 async handler 里同步执行，
+> 一个慢上游的 `getresponse()` 会占死整个事件循环，表现为并发请求排队、
+> 健康/状态接口一起冻结、inflight 准入在真实网络入口永远打不满。
+
+### 5.2 某个上游变慢 / 卡住 / 重启时的预期
+
+| 场景 | 预期 |
+| --- | --- |
+| 一个上游慢响应（在请求超时内） | 打到它的请求并行等待；**其它请求、其它路径照常即时处理** |
+| 一个上游卡住不返回 | 占用至多 1 个工作线程直到 `EG_REQUEST_TIMEOUT`（默认 2s）→ 按超时故障转移/拒绝；期间事件循环与其余请求不受影响 |
+| 一个上游正在重启（连接拒绝） | 立即得到 `UpstreamUnreachable`，幂等请求当场转移到下一实例；不等待 |
+| 全部上游都慢/不可用 | 只有走到上游的请求受影响（各自占工作线程并受超时上界约束）；`GET /healthz`、`GET /__admin/state`、`/__explain`、`/__routes` 与**无匹配路由**（不走上游）始终及时响应 |
+| 慢/重启持续较久 | 健康状态机按既有阈值摘除与后台探测自愈；准入窗口与判定不受影响 |
+
+边界与上界：工作线程数有界（默认 32），上游调用有 socket 超时上界
+（`EG_REQUEST_TIMEOUT`），所以即使所有上游同时冻结，被占住的资源也是
+有限且会自动归还的，不会无限堆积。
+
+### 5.3 三类准入在并发下的真实网络预期
+
+三类判定仍然在**同一把锁、同一个临界区**内"先逐项判定、全部通过再一起
+消费"，而消费发生在进入上游之前；真实网络入口的并发让"同时在途"成为
+常态，三类限制都能按各自边界真实触发：
+
+以 `payments-api`（rate=3/1s、inflight=2、quota=5/3s）为例，同一调用方：
+
+| 类别 | 真实网络入口下的触发方式 | 边界 | 被拒之后 |
+| --- | --- | --- | --- |
+| **rate 短突发** | 同一个 1s 窗口内超过 3 个请求**起步** | 窗口内恰好 3 个进入上游，第 4+ 个 `429 RATE_LIMITED` | 不执行上游、不消耗任何类别 |
+| **inflight 在途** | 2 个请求正在慢上游里执行时，再来请求 | 上游内同时最多 2 个；其余 `429 INFLIGHT_LIMIT_EXCEEDED` | 不执行上游；在途请求结束后槽位立即归还 |
+| **quota 周期额度** | 3s 窗口内累计起步满 5 个后，在新 burst 窗口再发请求（rate 已放行） | 第 6 个 `429 QUOTA_EXCEEDED`（响应里 rate 仍有剩余） | 不执行上游；额度不退还，随窗口滚动恢复 |
+
+- 并发、上游变慢或重启期间**绝不超额**：准入在调用上游之前的临界区内完成，
+  被拒请求根本不会建立到上游的连接。
+- 多类别同时触顶时按固定顺序 `rate → inflight → quota` 给出唯一拒绝类别，
+  响应体同时携带三类的 `limit/used(inflight)/remaining/window_*` 快照。
+- 用上游真实进程的用户请求执行计数（`/__admin/state` 的 `calls`）可直接
+  核对"被拒请求零上游执行、放行数恰好等于边界"。
+
+### 5.4 本地如何复现与验证
+
+一键起环境（网关 19080，见 1.2）：
+
+```bash
+uv run python -m edge_gateway.drill up
+uv run python -m edge_gateway.drill slow users-v1-1 0.5   # 每个响应真实慢 0.5s
+```
+
+```bash
+# (1) 并发并行：两个慢请求同时发，总耗时应接近 0.5s 而非 1.0s
+time (curl -s --noproxy '*' -H 'x-caller-id: c1' http://127.0.0.1:19080/users/1 &
+      curl -s --noproxy '*' -H 'x-caller-id: c2' http://127.0.0.1:19080/users/2 &
+      wait)
+
+# (2) 慢请求在途时，健康/状态接口立即返回（另开终端同时执行）
+curl -s --noproxy '*' http://127.0.0.1:19080/healthz
+curl -s --noproxy '*' http://127.0.0.1:19080/__admin/state
+curl -s -o /dev/null -w '%{http_code}\n' --noproxy '*' http://127.0.0.1:19080/unrelated
+
+# (3) inflight=2：5 个 /payments 同时打到慢上游，恰好 2 个 200、其余 429
+for i in 1 2 3 4 5; do
+  curl -s -o /dev/null -w '%{http_code}\n' --noproxy '*' -H 'x-caller-id: pay' \
+    http://127.0.0.1:19080/payments/1 &
+done; wait
+uv run python -m edge_gateway.drill status   # 看 users-v1-1 的 calls 增量
+
+uv run python -m edge_gateway.drill normal users-v1-1
+uv run python -m edge_gateway.drill down
+```
+
+自动化验证（真实上游进程 + 真实 asyncio 网络入口，无需手起服务）：
+
+```bash
+uv run pytest tests/test_network_concurrency.py -sv   # 见下
+```
+
+该文件覆盖并在日志中逐条打印用例输入/边界/结果：
+
+- `test_two_concurrent_slow_requests_run_in_parallel` —
+  两个 0.5s 慢请求并行总耗时 < 0.85s（串行会是 1.0s），且都真实到达上游；
+- `test_slow_upstream_does_not_freeze_gateway_endpoints` —
+  慢请求与 `/healthz`、`/__admin/state` 同时刻发出，后者在毫秒级完成
+  （修复前会被推迟到慢请求结束，即 ~0.5s）；
+- `test_slow_upstream_does_not_block_unrelated_requests` —
+  慢请求在途时，不相干地址（NO_ROUTE，不走上游）仍立即返回；
+- `test_rate_boundary_rejects_burst_beyond_limit_without_overadmit` —
+  同一 burst 窗口恰好 3 个进入上游，其余 RATE 拒绝，上游执行次数 == 3；
+- `test_inflight_boundary_holds_under_concurrent_slow_upstream` —
+  5 个并发打慢上游，恰好 2 个 200、3 个 429（含 INFLIGHT 拒绝），上游执行
+  次数 == 2，总耗时 ≈ 单个慢请求；
+- `test_quota_boundary_rejects_after_window_budget_exhausted` —
+  耗尽 5 个周期额度后，新 burst 窗口内 rate 仍有余量但被 QUOTA 拒绝，
+  上游执行次数恰为 5。
+
+## 6. 两种形态的响应差异
 
 - 模拟模式成功响应是可解释信封：`rule_id / cluster / instance_id / upstream_status /
   data / quota / admission / attempts / trace`。
@@ -152,7 +265,7 @@ PROBING → 探测：
 `INFLIGHT_LIMIT_EXCEEDED(429)`、`QUOTA_EXCEEDED(429)`、
 `NON_IDEMPOTENT_NOT_RETRIED(502)`、`ALL_UPSTREAMS_UNAVAILABLE(503)`。
 
-## 6. 管理 / 可观测端点
+## 7. 管理 / 可观测端点
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -163,7 +276,7 @@ PROBING → 探测：
 | `POST /__admin/faults` | 模拟模式：`fail/timeout/down/null`；网络模式：`error/slow/null`（真停进程用 drill CLI） |
 | `POST /__admin/reset` | 重置准入与健康（模拟模式还清故障与计数） |
 
-## 7. 兼容范围
+## 8. 兼容范围
 
 - 模拟模式的全部既有行为（路由优先级、冲突识别、无匹配、固定窗口配额、故障转移结论）保持不变：
   `quota_limit/quota_window_seconds` 字段语义不变；三类准入在未配置 rate/inflight 时退化为原配额语义。
@@ -173,7 +286,7 @@ PROBING → 探测：
   探测端点 `GET /__health`（正常/慢模式返回 200，错误模式返回 503）。
 - 仅依赖 Python 标准库 + FastAPI/httpx（测试用）；上游进程与网关均在本机回环地址运行。
 
-## 8. 本地验证
+## 9. 本地验证
 
 ```bash
 uv run pytest -q                                  # 全量（含真实进程与一键演练，约 40–50s）
@@ -182,6 +295,7 @@ uv run pytest tests/test_admission.py -q          # 三类准入边界 + 并发�
 uv run pytest tests/test_recovery.py -q           # 无流量后台自愈 / 事件记录 / 探测去重
 uv run pytest tests/test_network_upstream.py -q   # 真实进程停/重启恢复、慢/错、透传
 uv run pytest tests/test_network_http.py -q       # 网络模式 HTTP 透传 + 后台自愈集成
+uv run pytest tests/test_network_concurrency.py -sv  # 真实网络入口并发并行/慢上游隔离/三类准入边界
 uv run pytest tests/test_drill.py -q              # 一键起停 / 停进程 / 慢响应 / 错误
 ```
 
@@ -191,7 +305,8 @@ uv run pytest tests/test_drill.py -q              # 一键起停 / 停进程 / �
 # 原样透传（回显 method/path/query/header/body）
 curl -s -H 'x-caller-id: alice' 'http://127.0.0.1:19080/users/1?debug=1'
 
-# 三类准入：连发 4 个 /payments，第 4 个应为 429 RATE_LIMITED
+# 三类准入：顺序连发 4 个 /payments（每个快速返回、槽位已释放），
+# 同一 1s burst 窗口内第 4 个应为 429 RATE_LIMITED
 for i in 1 2 3 4; do
   curl -s -o /dev/null -w '%{http_code}\n' -H 'x-caller-id: pay' \
     http://127.0.0.1:19080/payments/1
@@ -210,7 +325,7 @@ uv run python -m edge_gateway.drill down
 > 若本机/环境设置了 HTTP 代理，对 `127.0.0.1` 的 `curl` 请加 `--noproxy '*'`，
 > 以免演练流量被代理截走。
 
-## 9. 代码结构
+## 10. 代码结构
 
 ```
 edge_gateway/
@@ -225,6 +340,8 @@ edge_gateway/
   recovery.py      # 与流量解耦的后台自愈守护线程
   gateway.py       # 路由→准入→健康感知分发→故障转移 主流水线（两种传输）
   drill.py         # 一键拉起/停止网关+上游进程、停/慢/错指定上游的演练 CLI
-  app.py           # FastAPI：app（模拟）与 network_app（真实上游，含后台自愈）
+  app.py           # FastAPI：app（模拟）与 network_app（真实上游，含后台自愈）；
+                   #         同步主管线在专用工作线程池执行，事件循环永不阻塞
 tests/             # 路由 / 准入 / 故障转移 / 自愈 / 真实进程 / HTTP / 一键演练
+                   #   test_network_concurrency.py: 真实网络入口的并发与三类准入边界
 ```
